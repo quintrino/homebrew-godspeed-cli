@@ -14,7 +14,7 @@ struct TaskRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     duration_minutes: Option<i32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    label_names: Vec<String>,
+    label_ids: Vec<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     notes: String,
 }
@@ -26,6 +26,17 @@ struct ListsResponse {
 
 #[derive(Deserialize, Debug)]
 struct ListItem {
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct LabelsResponse {
+    labels: Vec<LabelItem>,
+}
+
+#[derive(Deserialize, Debug)]
+struct LabelItem {
     id: String,
     name: String,
 }
@@ -48,6 +59,10 @@ fn get_lists_path() -> PathBuf {
     get_xdg_data_home().join("godspeed-cli").join("lists.toml")
 }
 
+fn get_labels_path() -> PathBuf {
+    get_xdg_data_home().join("godspeed-cli").join("labels.toml")
+}
+
 fn ensure_directories() -> io::Result<()> {
     let data_dir = get_xdg_data_home().join("godspeed-cli");
     fs::create_dir_all(&data_dir)?;
@@ -65,7 +80,7 @@ fn send_notification(message: &str) {
         .output();
 }
 
-fn parse_task(input: &str) -> (TaskRequest, Option<String>) {
+fn parse_task(input: &str) -> (TaskRequest, Option<String>, Vec<String>) {
     let mut title = String::new();
     let mut list_name: Option<String> = None;
     let mut duration_minutes: Option<i32> = None;
@@ -86,7 +101,7 @@ fn parse_task(input: &str) -> (TaskRequest, Option<String>) {
             // Extract label
             let label = word.trim_start_matches('.');
             if !label.is_empty() {
-                label_names.push(titlecase(label));
+                label_names.push(label.to_string());
             }
         } else if word.starts_with('@') {
             // Extract list name
@@ -121,24 +136,16 @@ fn parse_task(input: &str) -> (TaskRequest, Option<String>) {
             title,
             list_id: None, // Will be resolved later
             duration_minutes,
-            label_names,
+            label_ids: Vec::new(), // Will be resolved later
             notes,
         },
         list_name,
+        label_names,
     )
 }
 
-fn titlecase(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
-    }
-}
-
-fn load_lists_cache() -> HashMap<String, String> {
-    let lists_path = get_lists_path();
-    if let Ok(content) = fs::read_to_string(&lists_path) {
+fn load_cache(path: &PathBuf) -> HashMap<String, String> {
+    if let Ok(content) = fs::read_to_string(path) {
         if let Ok(table) = content.parse::<toml::Table>() {
             let mut map = HashMap::new();
             for (key, value) in table {
@@ -152,14 +159,13 @@ fn load_lists_cache() -> HashMap<String, String> {
     HashMap::new()
 }
 
-fn save_lists_cache(lists: &HashMap<String, String>) -> io::Result<()> {
-    let lists_path = get_lists_path();
+fn save_cache(path: &PathBuf, cache: &HashMap<String, String>) -> io::Result<()> {
     let mut table = toml::Table::new();
-    for (key, value) in lists {
+    for (key, value) in cache {
         table.insert(key.clone(), toml::Value::String(value.clone()));
     }
     let toml_string = toml::to_string(&table).unwrap();
-    fs::write(&lists_path, toml_string)?;
+    fs::write(path, toml_string)?;
     Ok(())
 }
 
@@ -176,6 +182,39 @@ fn fetch_lists(api_key: &str) -> Result<HashMap<String, String>, Box<dyn std::er
         map.insert(list.name.to_lowercase(), list.id);
     }
     Ok(map)
+}
+
+fn fetch_labels(api_key: &str) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .get("https://api.godspeedapp.com/labels")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()?;
+
+    let labels_response: LabelsResponse = response.json()?;
+    let mut map = HashMap::new();
+    for label in labels_response.labels {
+        map.insert(label.name.to_lowercase(), label.id);
+    }
+    Ok(map)
+}
+
+fn find_matching_key(cache: &HashMap<String, String>, search: &str) -> Option<String> {
+    let search_lower = search.to_lowercase();
+
+    // First try exact match
+    if let Some(id) = cache.get(&search_lower) {
+        return Some(id.clone());
+    }
+
+    // Then try prefix match
+    for (key, id) in cache {
+        if key.starts_with(&search_lower) {
+            return Some(id.clone());
+        }
+    }
+
+    None
 }
 
 fn send_task(task: &TaskRequest, api_key: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -236,28 +275,53 @@ fn remove_from_cache(task_str: &str) -> io::Result<()> {
 }
 
 fn process_task(task_str: &str, api_key: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut parsed, list_name) = parse_task(task_str);
+    let (mut parsed, list_name, label_names) = parse_task(task_str);
 
     // Handle list resolution
     if let Some(list_name_clean) = list_name {
-        let list_name_lower = list_name_clean.to_lowercase();
-        let mut lists_cache = load_lists_cache();
+        let mut lists_cache = load_cache(&get_lists_path());
 
-        if let Some(list_id) = lists_cache.get(&list_name_lower) {
-            parsed.list_id = Some(list_id.clone());
+        if let Some(list_id) = find_matching_key(&lists_cache, &list_name_clean) {
+            parsed.list_id = Some(list_id);
         } else {
             // Fetch lists from API
             lists_cache = fetch_lists(api_key)?;
-            save_lists_cache(&lists_cache)?;
+            save_cache(&get_lists_path(), &lists_cache)?;
 
-            if let Some(list_id) = lists_cache.get(&list_name_lower) {
-                parsed.list_id = Some(list_id.clone());
+            if let Some(list_id) = find_matching_key(&lists_cache, &list_name_clean) {
+                parsed.list_id = Some(list_id);
+            }
+        }
+    }
+
+    // Handle label resolution
+    if !label_names.is_empty() {
+        let mut labels_cache = load_cache(&get_labels_path());
+
+        // Check if we need to fetch labels
+        let mut need_fetch = false;
+        for label_name in &label_names {
+            if find_matching_key(&labels_cache, label_name).is_none() {
+                need_fetch = true;
+                break;
+            }
+        }
+
+        if need_fetch {
+            labels_cache = fetch_labels(api_key)?;
+            save_cache(&get_labels_path(), &labels_cache)?;
+        }
+
+        // Resolve all label names to IDs
+        for label_name in label_names {
+            if let Some(label_id) = find_matching_key(&labels_cache, &label_name) {
+                parsed.label_ids.push(label_id);
             }
         }
     }
 
     // Check for multiple lists
-    let list_count = task_str.split_whitespace().filter(|w| w.starts_with('~')).count();
+    let list_count = task_str.split_whitespace().filter(|w| w.starts_with('@')).count();
     if list_count > 1 {
         send_notification("Error: Multiple lists specified");
         return Err("Multiple lists specified".into());
