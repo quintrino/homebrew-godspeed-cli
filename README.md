@@ -11,7 +11,13 @@ export GODSPEED_API="your-api-key-here"
 
 Add this to your `.zshrc` or `config.fish` to make it permanent.
 
-Either use the binary godspeed-cli at /target/release/ or
+Install via homebrew
+```
+brew install quintrino/godspeed-cli/godspeed-cli
+````
+  
+or 
+
 
 2. Build the project:
 ```bash
